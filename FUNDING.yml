@@ -1,0 +1,6 @@
+# Funding options for Rasputin and other Geekdojo open-source projects.
+# This is an org-level default (in the geekdojo/.github repo), so the "Sponsor"
+# button appears on every public repo that doesn't define its own FUNDING.yml.
+# The button only renders once GitHub Sponsors is enrolled and approved for the
+# geekdojo organization (Settings > Sponsors). Until then this file is inert.
+github: geekdojo

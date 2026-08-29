@@ -14,6 +14,7 @@ images and a four-step quickstart.
 | [rasputin-control-plane](https://github.com/geekdojo/rasputin-control-plane) | The brain: Go API + web UI + node agent |
 | [rasputin-os](https://github.com/geekdojo/rasputin-os) | Buildroot-based node OS (Pi + N100), RAUC A/B updates |
 | [rasputin-openwrt-firewall](https://github.com/geekdojo/rasputin-openwrt-firewall) | OpenWrt-based firewall image, GRUB A/B updates, snort3 IDS |
+| [rasputin-agents](https://github.com/geekdojo/rasputin-agents) | Agent-facing install & ops tooling: Claude Code plugin marketplace + portable Agent Skills |
 
 Everything is AGPL-3.0. **Status: pre-alpha** — commodity-hardware proof
 phase, running on real Pis and N100 boxes today; custom hardware comes later.

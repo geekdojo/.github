@@ -12,7 +12,7 @@ images and a four-step quickstart.
 | Repo | What it is |
 | --- | --- |
 | [rasputin-control-plane](https://github.com/geekdojo/rasputin-control-plane) | The brain: Go API + web UI + node agent |
-| [rasputin-os](https://github.com/geekdojo/rasputin-os) | Buildroot-based node OS (Pi + N100), RAUC A/B updates |
+| [rasputin-os](https://github.com/geekdojo/rasputin-os) | Buildroot-based node OS (Pi + amd64 w/UEFI), RAUC A/B updates |
 | [rasputin-openwrt-firewall](https://github.com/geekdojo/rasputin-openwrt-firewall) | OpenWrt-based firewall image, GRUB A/B updates, snort3 IDS |
 | [rasputin-app-catalog](https://github.com/geekdojo/rasputin-app-catalog) | The app catalog: signed tile bundles, published on their own cadence |
 | [rasputin-agents](https://github.com/geekdojo/rasputin-agents) | Agent-facing install & ops tooling: Claude Code plugin marketplace + portable Agent Skills |

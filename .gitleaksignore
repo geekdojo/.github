@@ -1,0 +1,3 @@
+# THROWAWAY PROBE (never merged): proves the gate-change warning fires.
+# probe reason: placeholder fingerprint that matches no finding
+0000000000000000000000000000000000000000:probe.txt:generic-api-key:1

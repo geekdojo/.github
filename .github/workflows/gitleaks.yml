@@ -51,6 +51,98 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      - name: warn when the pull request changes the secret-scan gate
+        # A pull request can weaken this gate from the inside: add a fingerprint
+        # to .gitleaksignore to silence its own finding, or edit the workflows
+        # that run the scan. The scan cannot judge that, so this step makes it
+        # loud for the reviewer: a warning annotation per changed file and a
+        # step-summary section listing each added fingerprint under its reason.
+        #
+        # It never fails the job (warning, not gate) and needs nothing beyond
+        # contents: read. It runs before the install and scan steps so the
+        # warning is there even when the scan fails.
+        #
+        # Untrusted text never reaches stdout, where a line could be read as a
+        # workflow command: annotations name only the fixed paths below, and the
+        # file's contents go to the step summary, HTML-escaped, inside <pre>.
+        if: github.event_name == 'pull_request'
+        continue-on-error: true
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set +e
+          summary="${GITHUB_STEP_SUMMARY:-/dev/null}"
+
+          # Three dots: what the pull request's own commits change since it
+          # branched, not what main gained in the meantime. --no-renames lists
+          # a renamed-away gate file under its old path too.
+          if ! changed=$(git diff --no-renames --name-only "${BASE_SHA}...${HEAD_SHA}" 2>/dev/null); then
+            echo "::warning title=Secret-scan gate not checked::Could not diff this pull request's base against its head, so changes to .gitleaksignore and the gitleaks workflows were not checked. Review them by hand."
+            exit 0
+          fi
+
+          hits=""
+          for path in .gitleaksignore .github/workflows/gitleaks.yml .github/workflows/secret-scan.yml; do
+            if printf '%s\n' "$changed" | grep -qxF "$path"; then
+              hits="${hits} ${path}"
+              echo "::warning file=${path},title=Secret-scan gate changed::This PR changes ${path}, part of the secret-scan gate. Review before merging."
+            fi
+          done
+
+          if [ -z "$hits" ]; then
+            echo "This pull request does not change the secret-scan gate."
+            exit 0
+          fi
+
+          {
+            echo "## ⚠️ This PR changes the secret-scan gate — review before merging"
+            echo
+            echo "These files decide what the gitleaks check reports. A change to them can silence or weaken it:"
+            echo
+            for path in $hits; do echo "- \`${path}\`"; done
+            echo
+          } >> "$summary"
+
+          case " ${hits} " in
+            *" .gitleaksignore "*) ;;
+            *) exit 0 ;;
+          esac
+
+          added="${RUNNER_TEMP}/gitleaksignore-added"
+          head_file="${RUNNER_TEMP}/gitleaksignore-head"
+          git diff --no-renames --unified=0 "${BASE_SHA}...${HEAD_SHA}" -- .gitleaksignore 2>/dev/null \
+            | awk '/^\+\+\+/ { next } /^\+/ { l = substr($0, 2); if (l !~ /^[ \t]*#/ && l ~ /[^ \t]/) print l }' > "$added"
+          git show "${HEAD_SHA}:.gitleaksignore" > "$head_file" 2>/dev/null
+
+          {
+            echo "### Fingerprints added to \`.gitleaksignore\`"
+            echo
+            if [ -s "$added" ]; then
+              echo "Each fingerprint is shown under the \`#\` comment above it in the pull request's version of the file. Secret values are never part of a fingerprint."
+              echo
+              echo "<pre>"
+              # Each added fingerprint with the comment block directly above it.
+              awk '
+                NR == FNR { add[$0] = 1; next }
+                /^[ \t]*#/ { buf = buf $0 "\n"; next }
+                /^[ \t]*$/ { buf = ""; next }
+                {
+                  if ($0 in add) {
+                    if (buf == "") buf = "# (no reason comment)\n"
+                    printf "%s%s\n\n", buf, $0
+                    delete add[$0]
+                  }
+                  buf = ""
+                }
+              ' "$added" "$head_file" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'
+              echo "</pre>"
+            else
+              echo "None. The change removes or rewords entries only."
+            fi
+          } >> "$summary"
+          exit 0
+
       - name: install gitleaks (checksum-verified)
         run: |
           set -euo pipefail

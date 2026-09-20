@@ -1,0 +1,332 @@
+name: rasputin-sign
+
+# Exercises .github/actions/rasputin-sign against a throwaway PKI minted on the
+# runner. Every signing repository in the organisation calls that action by
+# SHA, so a regression here is a regression in the gate that decides whether a
+# release can be installed by the fleet at all — and it would otherwise only
+# surface inside a two-hour image build.
+#
+# Each rejection case asserts an OUTCOME: it runs with continue-on-error and
+# the step after it fails the job if the action accepted something it must
+# refuse. A gate that only ever runs against good input is not tested.
+#
+# The fixture root is generated on the runner and thrown away with it. No
+# Rasputin credential, secret or variable is used anywhere in this workflow.
+
+on:
+  push:
+    paths:
+      - '.github/actions/rasputin-sign/**'
+      - '.github/workflows/rasputin-sign-test.yml'
+  pull_request:
+    paths:
+      - '.github/actions/rasputin-sign/**'
+      - '.github/workflows/rasputin-sign-test.yml'
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  preflight:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Mint fixture PKI
+        id: pki
+        run: |
+          set -euo pipefail
+          bash .github/actions/rasputin-sign/test/mint-fixtures.sh "$RUNNER_TEMP/pki"
+          emit() {
+            # $1 = output name, $2 = file. A random delimiter, because PEM is
+            # multi-line and a fixed one is injectable.
+            local d
+            d="EOF_$(openssl rand -hex 8)"
+            printf '%s<<%s\n' "$1" "$d" >> "$GITHUB_OUTPUT"
+            cat "$2" >> "$GITHUB_OUTPUT"
+            printf '\n%s\n' "$d" >> "$GITHUB_OUTPUT"
+          }
+          cd "$RUNNER_TEMP/pki"
+          emit root root-ca.pem
+          for n in release-good release-no-email release-no-codesign release-no-oid \
+                   release-longer-arc catalog-good catalog-codesigning release-leafonly; do
+            # Output names carry underscores: a hyphen in a property name is
+            # parsed as subtraction by the workflow expression grammar.
+            u=${n//-/_}
+            emit "${u}_cert" "${n}-chain.pem"
+            emit "${u}_key"  "${n}.key"
+          done
+
+      # ---- accept ---------------------------------------------------------
+      - name: A good release leaf is accepted
+        id: ok_release
+        uses: ./.github/actions/rasputin-sign
+        with:
+          purpose: release
+          dir: /mnt/t-ok-release
+          leaf-key: ${{ steps.pki.outputs.release_good_key }}
+          leaf-cert: ${{ steps.pki.outputs.release_good_cert }}
+          root-ca: ${{ steps.pki.outputs.root }}
+
+      - name: Sign an artifact and self-verify it as release
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          printf 'rasputin release artifact\n' > out/artifact.bin
+          openssl cms -sign -binary -in out/artifact.bin \
+            -signer   '${{ steps.ok_release.outputs.leaf }}' \
+            -certfile '${{ steps.ok_release.outputs.intermediate }}' \
+            -inkey    '${{ steps.ok_release.outputs.key }}' \
+            -outform DER -out out/artifact.bin.sig
+
+      - name: Self-verify (release purpose) accepts a good signature
+        uses: ./.github/actions/rasputin-sign
+        with:
+          mode: verify
+          purpose: release
+          dir: /mnt/t-ok-release
+          artifacts: out/artifact.bin
+
+      # Different bytes under the signature that was just produced. If verify
+      # mode passed this, the self-verify step in every release workflow would
+      # be proving nothing.
+      - name: Stage a tampered artifact
+        run: |
+          set -euo pipefail
+          printf 'rasputin release artifact TAMPERED\n' > out/tampered.bin
+          cp out/artifact.bin.sig out/tampered.bin.sig
+
+      - name: Self-verify rejects a tampered artifact
+        id: tampered
+        continue-on-error: true
+        uses: ./.github/actions/rasputin-sign
+        with:
+          mode: verify
+          purpose: release
+          dir: /mnt/t-ok-release
+          artifacts: out/tampered.bin
+
+      - name: Self-verify rejects an artifact with no signature
+        id: nosig
+        continue-on-error: true
+        uses: ./.github/actions/rasputin-sign
+        with:
+          mode: verify
+          purpose: release
+          dir: /mnt/t-ok-release
+          artifacts: out/artifact.bin.sig
+
+      - name: Release credential wiped
+        if: always()
+        uses: ./.github/actions/rasputin-sign
+        with:
+          mode: cleanup
+          dir: /mnt/t-ok-release
+
+      - name: A good catalog leaf is accepted
+        id: ok_catalog
+        uses: ./.github/actions/rasputin-sign
+        with:
+          purpose: catalog
+          dir: /mnt/t-ok-catalog
+          leaf-key: ${{ steps.pki.outputs.catalog_good_key }}
+          leaf-cert: ${{ steps.pki.outputs.catalog_good_cert }}
+          root-ca: ${{ steps.pki.outputs.root }}
+
+      - name: Sign a catalog artifact and self-verify it
+        run: |
+          set -euo pipefail
+          printf 'rasputin catalog bundle\n' > out/catalog.bin
+          openssl cms -sign -binary -in out/catalog.bin \
+            -signer   '${{ steps.ok_catalog.outputs.leaf }}' \
+            -certfile '${{ steps.ok_catalog.outputs.intermediate }}' \
+            -inkey    '${{ steps.ok_catalog.outputs.key }}' \
+            -outform DER -out out/catalog.bin.sig
+
+      - name: Self-verify (catalog purpose) accepts a good signature
+        uses: ./.github/actions/rasputin-sign
+        with:
+          mode: verify
+          purpose: catalog
+          dir: /mnt/t-ok-catalog
+          artifacts: out/catalog.bin
+
+      - name: Catalog credential wiped
+        if: always()
+        uses: ./.github/actions/rasputin-sign
+        with:
+          mode: cleanup
+          dir: /mnt/t-ok-catalog
+
+      # ---- reject ---------------------------------------------------------
+      # leaf-002's shape: a perfect chain with no emailProtection. Every
+      # deployed board refuses what it signs.
+      - name: Release leaf without emailProtection
+        id: no_email
+        continue-on-error: true
+        uses: ./.github/actions/rasputin-sign
+        with:
+          purpose: release
+          dir: /mnt/t-no-email
+          leaf-key: ${{ steps.pki.outputs.release_no_email_key }}
+          leaf-cert: ${{ steps.pki.outputs.release_no_email_cert }}
+          root-ca: ${{ steps.pki.outputs.root }}
+
+      - name: Release leaf without codeSigning
+        id: no_codesign
+        continue-on-error: true
+        uses: ./.github/actions/rasputin-sign
+        with:
+          purpose: release
+          dir: /mnt/t-no-codesign
+          leaf-key: ${{ steps.pki.outputs.release_no_codesign_key }}
+          leaf-cert: ${{ steps.pki.outputs.release_no_codesign_cert }}
+          root-ca: ${{ steps.pki.outputs.root }}
+
+      - name: Release leaf without the Rasputin release OID
+        id: no_oid
+        continue-on-error: true
+        uses: ./.github/actions/rasputin-sign
+        with:
+          purpose: release
+          dir: /mnt/t-no-oid
+          leaf-key: ${{ steps.pki.outputs.release_no_oid_key }}
+          leaf-cert: ${{ steps.pki.outputs.release_no_oid_cert }}
+          root-ca: ${{ steps.pki.outputs.root }}
+
+      - name: Catalog leaf carrying codeSigning
+        id: cat_codesign
+        continue-on-error: true
+        uses: ./.github/actions/rasputin-sign
+        with:
+          purpose: catalog
+          dir: /mnt/t-cat-codesign
+          leaf-key: ${{ steps.pki.outputs.catalog_codesigning_key }}
+          leaf-cert: ${{ steps.pki.outputs.catalog_codesigning_cert }}
+          root-ca: ${{ steps.pki.outputs.root }}
+
+      - name: A release leaf is not a catalog leaf
+        id: crossed
+        continue-on-error: true
+        uses: ./.github/actions/rasputin-sign
+        with:
+          purpose: catalog
+          dir: /mnt/t-crossed
+          leaf-key: ${{ steps.pki.outputs.release_good_key }}
+          leaf-cert: ${{ steps.pki.outputs.release_good_cert }}
+          root-ca: ${{ steps.pki.outputs.root }}
+
+      # The release OID is a textual prefix of this leaf's, so a substring test
+      # accepts it for a purpose nothing has minted yet (#474).
+      - name: A leaf on a longer arc than the release purpose
+        id: longer_arc
+        continue-on-error: true
+        uses: ./.github/actions/rasputin-sign
+        with:
+          purpose: release
+          dir: /mnt/t-longer-arc
+          leaf-key: ${{ steps.pki.outputs.release_longer_arc_key }}
+          leaf-cert: ${{ steps.pki.outputs.release_longer_arc_cert }}
+          root-ca: ${{ steps.pki.outputs.root }}
+
+      - name: A catalog leaf is not a release leaf
+        id: crossed_back
+        continue-on-error: true
+        uses: ./.github/actions/rasputin-sign
+        with:
+          purpose: release
+          dir: /mnt/t-crossed-back
+          leaf-key: ${{ steps.pki.outputs.catalog_good_key }}
+          leaf-cert: ${{ steps.pki.outputs.catalog_good_cert }}
+          root-ca: ${{ steps.pki.outputs.root }}
+
+      - name: A leaf-only cert secret
+        id: leafonly
+        continue-on-error: true
+        uses: ./.github/actions/rasputin-sign
+        with:
+          purpose: release
+          dir: /mnt/t-leafonly
+          leaf-key: ${{ steps.pki.outputs.release_leafonly_key }}
+          leaf-cert: ${{ steps.pki.outputs.release_leafonly_cert }}
+          root-ca: ${{ steps.pki.outputs.root }}
+
+      - name: An empty credential
+        id: empty
+        continue-on-error: true
+        uses: ./.github/actions/rasputin-sign
+        with:
+          purpose: release
+          dir: /mnt/t-empty
+          leaf-key: ''
+          leaf-cert: ''
+          root-ca: ${{ steps.pki.outputs.root }}
+
+      - name: An empty verify list
+        id: emptyverify
+        continue-on-error: true
+        uses: ./.github/actions/rasputin-sign
+        with:
+          mode: verify
+          purpose: release
+          dir: /mnt/t-empty
+          artifacts: ''
+
+      - name: A missing purpose
+        id: nopurpose
+        continue-on-error: true
+        uses: ./.github/actions/rasputin-sign
+        with:
+          purpose: ''
+          dir: /mnt/t-nopurpose
+          leaf-key: ${{ steps.pki.outputs.release_good_key }}
+          leaf-cert: ${{ steps.pki.outputs.release_good_cert }}
+          root-ca: ${{ steps.pki.outputs.root }}
+
+      # "codesign" reads like a purpose and is not one. An unknown value must
+      # stop the job, never fall through to a default check set.
+      - name: An unknown purpose
+        id: badpurpose
+        continue-on-error: true
+        uses: ./.github/actions/rasputin-sign
+        with:
+          purpose: codesign
+          dir: /mnt/t-badpurpose
+          leaf-key: ${{ steps.pki.outputs.release_good_key }}
+          leaf-cert: ${{ steps.pki.outputs.release_good_cert }}
+          root-ca: ${{ steps.pki.outputs.root }}
+
+      - name: Assert every rejection case was rejected
+        env:
+          OUTCOMES: |
+            tampered=${{ steps.tampered.outcome }}
+            nosig=${{ steps.nosig.outcome }}
+            no_email=${{ steps.no_email.outcome }}
+            no_codesign=${{ steps.no_codesign.outcome }}
+            no_oid=${{ steps.no_oid.outcome }}
+            cat_codesign=${{ steps.cat_codesign.outcome }}
+            crossed=${{ steps.crossed.outcome }}
+            crossed_back=${{ steps.crossed_back.outcome }}
+            longer_arc=${{ steps.longer_arc.outcome }}
+            leafonly=${{ steps.leafonly.outcome }}
+            empty=${{ steps.empty.outcome }}
+            emptyverify=${{ steps.emptyverify.outcome }}
+            nopurpose=${{ steps.nopurpose.outcome }}
+            badpurpose=${{ steps.badpurpose.outcome }}
+        run: |
+          set -euo pipefail
+          bad=0
+          while IFS= read -r line; do
+            [ -n "${line//[[:space:]]/}" ] || continue
+            name=${line%%=*}; outcome=${line#*=}
+            name=${name//[[:space:]]/}; outcome=${outcome//[[:space:]]/}
+            if [ "$outcome" = failure ]; then
+              echo "  rejected, as required: $name"
+            else
+              echo "::error::rasputin-sign ACCEPTED input it must refuse: $name (outcome=$outcome)"
+              bad=1
+            fi
+          done <<< "$OUTCOMES"
+          [ "$bad" -eq 0 ]

@@ -78,6 +78,12 @@ mint release-no-codesign digitalSignature "emailProtection,${OID_RELEASE}"
 # Every X509 purpose satisfied, no Rasputin purpose OID — artifactsig refuses it.
 mint release-no-oid digitalSignature "codeSigning,emailProtection"
 
+# A leaf carrying 1.3.6.1.4.1.66587.1.1.11 and NOT ...1.1.1. The release OID is
+# a textual prefix of it, so a substring test accepts this leaf for the release
+# purpose (geekdojo/geekdojo-brain#474). Nothing has minted ...1.1.11 yet, which
+# is exactly why a gate must not accept it in advance.
+mint release-longer-arc digitalSignature "codeSigning,emailProtection,${OID_RELEASE}1"
+
 # What pki-init.sh --catalog-leaf issues: the catalog OID and nothing else.
 mint catalog-good digitalSignature "${OID_CATALOG}"
 

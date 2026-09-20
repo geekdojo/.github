@@ -51,7 +51,7 @@ jobs:
           cd "$RUNNER_TEMP/pki"
           emit root root-ca.pem
           for n in release-good release-no-email release-no-codesign release-no-oid \
-                   catalog-good catalog-codesigning release-leafonly; do
+                   release-longer-arc catalog-good catalog-codesigning release-leafonly; do
             # Output names carry underscores: a hyphen in a property name is
             # parsed as subtraction by the workflow expression grammar.
             u=${n//-/_}
@@ -218,6 +218,19 @@ jobs:
           leaf-cert: ${{ steps.pki.outputs.release_good_cert }}
           root-ca: ${{ steps.pki.outputs.root }}
 
+      # The release OID is a textual prefix of this leaf's, so a substring test
+      # accepts it for a purpose nothing has minted yet (#474).
+      - name: A leaf on a longer arc than the release purpose
+        id: longer_arc
+        continue-on-error: true
+        uses: ./.github/actions/rasputin-sign
+        with:
+          purpose: release
+          dir: /mnt/t-longer-arc
+          leaf-key: ${{ steps.pki.outputs.release_longer_arc_key }}
+          leaf-cert: ${{ steps.pki.outputs.release_longer_arc_cert }}
+          root-ca: ${{ steps.pki.outputs.root }}
+
       - name: A catalog leaf is not a release leaf
         id: crossed_back
         continue-on-error: true
@@ -296,6 +309,7 @@ jobs:
             cat_codesign=${{ steps.cat_codesign.outcome }}
             crossed=${{ steps.crossed.outcome }}
             crossed_back=${{ steps.crossed_back.outcome }}
+            longer_arc=${{ steps.longer_arc.outcome }}
             leafonly=${{ steps.leafonly.outcome }}
             empty=${{ steps.empty.outcome }}
             emptyverify=${{ steps.emptyverify.outcome }}

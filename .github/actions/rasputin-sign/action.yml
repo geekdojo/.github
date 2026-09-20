@@ -1,0 +1,320 @@
+name: Rasputin signing credential
+description: >-
+  Stage a Rasputin signing credential on tmpfs, preflight it against the checks
+  scripts/pki-init.sh runs at mint time, and self-verify detached CMS signatures
+  before they are published.
+
+# ONE shared action for every repository that signs a Rasputin artifact
+# (geekdojo/geekdojo-brain#524). Callers pin it by commit SHA:
+#
+#   - uses: geekdojo/.github/.github/actions/rasputin-sign@<40-hex-sha> # vN
+#     with:
+#       mode: preflight
+#       purpose: release          # or: catalog
+#       leaf-key:  ${{ secrets.RASPUTIN_LEAF_KEY }}
+#       leaf-cert: ${{ secrets.RASPUTIN_LEAF_CERT }}
+#       root-ca:   ${{ vars.RASPUTIN_ROOT_CA_PEM }}
+#
+# WHY IT IS SHARED. Every signing repository grew its own copy of the same
+# fifty lines, and the copies had drifted: rasputin-os checks the three
+# properties a release leaf actually needs, rasputin-openwrt-firewall checked
+# only that the chain resolves, and rasputin-app-catalog checks the catalog
+# leaf's own two. A chain that resolves is NOT a usable signing leaf — that
+# exact gap shipped leaf-002 and killed rasputin-os release run #171 fifty
+# minutes in, with `rauc bundle` reporting "unsuitable certificate purpose"
+# (X509_V_ERR_INVALID_PURPOSE) about a certificate whose chain was perfect.
+# One copy means one place to fix, and the same gate everywhere.
+#
+# WHAT THE PREFLIGHT IS. It is the check set in rasputin-control-plane
+# scripts/pki-init.sh (verify_release_leaf, and the catalog-leaf block), run
+# again here against the credential CI was actually handed. pki-init proves a
+# leaf at mint time; this proves the SECRET still holds that leaf, which is a
+# different claim — a secret can be pasted wrong, truncated, or rotated to the
+# wrong material long after minting. Keep the two lists identical: if a check
+# is added to pki-init, add it here in the same change.
+#
+# MODES
+#   preflight (default) — stage the credential on tmpfs and gate it.
+#   verify              — self-verify detached CMS signatures over artifacts,
+#                         the way the consumer of that purpose verifies them.
+#   cleanup             — unmount the tmpfs. Run it with `if: always()`.
+
+inputs:
+  mode:
+    description: 'preflight | verify | cleanup'
+    required: false
+    default: preflight
+  purpose:
+    description: >-
+      Artifact class this credential signs: "release" (OS + firewall images,
+      RAUC bundles, manifests) or "catalog" (app-catalog bundles). Selects the
+      preflight check set and the verification purpose. Required for preflight
+      and verify.
+    required: false
+    default: ''
+  leaf-key:
+    description: 'PEM private key for the signing leaf. A secret.'
+    required: false
+    default: ''
+  leaf-cert:
+    description: >-
+      PEM bundle holding the signing leaf FIRST and its issuing intermediate
+      SECOND. A secret. Both are required: the leaf alone cannot be chained to
+      the root by a device that holds only the root.
+    required: false
+    default: ''
+  root-ca:
+    description: 'PEM root CA the fleet trusts. Public; normally an org variable.'
+    required: false
+    default: ''
+  dir:
+    description: 'tmpfs mount point for the staged credential.'
+    required: false
+    default: /mnt/rasputin-sign
+  artifacts:
+    description: >-
+      verify mode: newline-separated list of signed files. Each line is a path
+      to the CONTENT; its detached signature is that path plus sig-suffix.
+    required: false
+    default: ''
+  sig-suffix:
+    description: 'verify mode: suffix appended to each artifact path to find its signature.'
+    required: false
+    default: .sig
+
+outputs:
+  dir:
+    description: 'Directory holding the staged credential.'
+    value: ${{ steps.stage.outputs.dir }}
+  key:
+    description: 'Path to the leaf private key.'
+    value: ${{ steps.stage.outputs.key }}
+  leaf:
+    description: 'Path to the leaf certificate alone.'
+    value: ${{ steps.stage.outputs.leaf }}
+  intermediate:
+    description: 'Path to the intermediate certificate alone.'
+    value: ${{ steps.stage.outputs.intermediate }}
+  root:
+    description: 'Path to the root CA certificate.'
+    value: ${{ steps.stage.outputs.root }}
+  purpose-oid:
+    description: 'The Rasputin purpose OID required of this leaf.'
+    value: ${{ steps.stage.outputs.purpose-oid }}
+
+runs:
+  using: composite
+  steps:
+    - name: Stage and preflight the signing credential
+      id: stage
+      if: ${{ inputs.mode == 'preflight' }}
+      shell: bash
+      env:
+        LEAF_KEY: ${{ inputs.leaf-key }}
+        LEAF_CERT: ${{ inputs.leaf-cert }}
+        ROOT_PEM: ${{ inputs.root-ca }}
+        PURPOSE: ${{ inputs.purpose }}
+        DIR: ${{ inputs.dir }}
+      run: |
+        set -euo pipefail
+
+        # Purpose OIDs under Geekdojo's IANA Private Enterprise Number 66587.
+        # These MUST stay identical to rasputin-control-plane artifactsig/eku.go
+        # and scripts/pki-init.sh. A leaf minted under a different arc than the
+        # verifier expects is refused by the whole fleet, and the symptom is
+        # "updates stopped working", not an error anyone can read.
+        OID_RELEASE=1.3.6.1.4.1.66587.1.1.1
+        OID_CATALOG=1.3.6.1.4.1.66587.1.1.2
+
+        case "$PURPOSE" in
+          release) want_oid=$OID_RELEASE ;;
+          catalog) want_oid=$OID_CATALOG ;;
+          '') echo "::error::rasputin-sign: purpose is required in preflight mode (release|catalog)"; exit 1 ;;
+          *)  echo "::error::rasputin-sign: unknown purpose '$PURPOSE' (want release|catalog)"; exit 1 ;;
+        esac
+
+        if [ -z "${LEAF_KEY:-}" ] || [ -z "${LEAF_CERT:-}" ] || [ -z "${ROOT_PEM:-}" ]; then
+          echo "::error::rasputin-sign: leaf-key, leaf-cert and root-ca are all required. The key and cert come from this repository's signing ENVIRONMENT secrets; the root is the RASPUTIN_ROOT_CA_PEM organisation variable. An empty value here usually means the job is missing its 'environment:' key, so the environment's secrets were never exposed to it."
+          exit 1
+        fi
+
+        # tmpfs, never the runner's disk: the key must not survive in a page
+        # cache or a swapped-out block after the job ends.
+        sudo mkdir -p "$DIR"
+        sudo mount -t tmpfs -o "size=8M,mode=0700,uid=$(id -u),gid=$(id -g)" tmpfs "$DIR"
+        umask 077
+        printf '%s' "$LEAF_KEY"  > "$DIR/leaf.key"
+        printf '%s' "$LEAF_CERT" > "$DIR/leaf-chain.pem"
+        printf '%s' "$ROOT_PEM"  > "$DIR/root-ca.pem"
+
+        # Split the chain secret into leaf + intermediate. Both `rauc bundle`
+        # and `openssl cms -sign` embed only the --cert/-signer certificate, so
+        # the intermediate has to be handed over separately for a device that
+        # trusts only the root to build leaf -> intermediate -> root.
+        awk -v leaf="$DIR/leaf.pem" -v inter="$DIR/intermediate.pem" \
+          '/-----BEGIN CERTIFICATE-----/{i++} {if(i==1)print > leaf; else if(i==2)print > inter}' \
+          "$DIR/leaf-chain.pem"
+
+        # A one-certificate secret splits without complaint and leaves an EMPTY
+        # intermediate.pem, which every check below still passes when the root
+        # is handed in as -CAfile. The artifact then ships a signature nothing
+        # in the field can chain, so count the certificates rather than trust
+        # the split.
+        ncerts=$(grep -c -- '-----BEGIN CERTIFICATE-----' "$DIR/leaf-chain.pem" || true)
+        if [ "$ncerts" -lt 2 ]; then
+          echo "::error::rasputin-sign: the leaf-cert secret holds $ncerts certificate(s); it must hold the leaf AND its intermediate, leaf first. Rebuild it with: cat leaf-NNN.pem intermediate-ca.pem"
+          exit 1
+        fi
+
+        echo "==> Preflighting the $PURPOSE signing leaf"
+        openssl x509 -in "$DIR/leaf.pem" -noout -subject -issuer -enddate
+        failed=0
+
+        eku=$(openssl x509 -in "$DIR/leaf.pem" -noout -ext extendedKeyUsage 2>/dev/null || true)
+        ku=$(openssl x509 -in "$DIR/leaf.pem" -noout -ext keyUsage 2>/dev/null || true)
+
+        if [ "$PURPOSE" = release ]; then
+          # 1. smimesign is OpenSSL CMS_verify's DEFAULT purpose, and therefore
+          #    what `rauc bundle` and every deployed board enforce today: no
+          #    shipped rasputin-os board sets [keyring] check-purpose, so the
+          #    S/MIME purpose is the effective requirement on the whole fleet
+          #    whatever we think we are issuing. It needs emailProtection in
+          #    the leaf's EKU. Never send this check's stderr to /dev/null.
+          if openssl verify -CAfile "$DIR/root-ca.pem" -untrusted "$DIR/intermediate.pem" \
+               -purpose smimesign "$DIR/leaf.pem"; then
+            echo "    purpose smimesign: OK"
+          else
+            echo "::error::rasputin-sign: the signing leaf fails the 'smimesign' X509 purpose, which is what OpenSSL CMS_verify enforces by default — i.e. every deployed board. Artifacts this leaf signs cannot be installed by the fleet. Re-mint with scripts/pki-init.sh --rotate-leaf in rasputin-control-plane."
+            failed=1
+          fi
+
+          # 2. RAUC's codesign semantics, checked DIRECTLY on the extensions.
+          #    Do not switch this to `-purpose codesign`: that purpose does not
+          #    exist in OpenSSL 3.0.13 (ubuntu-latest), where asking for it
+          #    yields "Invalid purpose codesign" — a failure about the tool and
+          #    not the certificate. It cost a release build once already, on a
+          #    leaf that was correct. Checking the extensions is also the more
+          #    faithful test: RAUC registers its OWN purpose via
+          #    X509_PURPOSE_add ("codesign-rauc", src/signature.c), whose
+          #    callback asks a leaf for precisely these two things.
+          if grep -q "Code Signing" <<<"$eku" && grep -q "Digital Signature" <<<"$ku"; then
+            echo "    RAUC codesign semantics (EKU codeSigning + KU digitalSignature): OK"
+          else
+            echo "::error::rasputin-sign: the signing leaf fails RAUC's codesign semantics, so a board configured with [keyring] check-purpose=codesign refuses every artifact it signs. extendedKeyUsage: ${eku:-<none>} / keyUsage: ${ku:-<none>}"
+            failed=1
+          fi
+        else
+          # A catalog leaf carries the catalog OID and NOTHING ELSE —
+          # deliberately not codeSigning. That single omission is the whole
+          # blast-radius separation (ADR-0006 Decision 3): a holder of the
+          # catalog key cannot produce a signature the OTA path accepts.
+          # `-purpose any` because the catalog leaf has no emailProtection, so
+          # OpenSSL's default purpose rejects it on that basis alone; the
+          # catalog verifier passes the same flag.
+          if openssl verify -CAfile "$DIR/root-ca.pem" -untrusted "$DIR/intermediate.pem" \
+               -purpose any "$DIR/leaf.pem"; then
+            echo "    chain to root (-purpose any): OK"
+          else
+            echo "::error::rasputin-sign: the catalog leaf does not chain to the root."
+            failed=1
+          fi
+          if grep -q "Code Signing" <<<"$eku"; then
+            echo "::error::rasputin-sign: the catalog leaf carries codeSigning — it must not. It is distinct from the release leaf by design so that a catalog key cannot sign an OS or firmware artifact. extendedKeyUsage: $eku"
+            failed=1
+          else
+            echo "    catalog leaf does not carry codeSigning: OK"
+          fi
+          if grep -q "Digital Signature" <<<"$ku"; then
+            echo "    keyUsage digitalSignature: OK"
+          else
+            echo "::error::rasputin-sign: the catalog leaf's keyUsage does not include Digital Signature. keyUsage: ${ku:-<none>}"
+            failed=1
+          fi
+        fi
+
+        # 3. The Rasputin purpose OID. artifactsig authorises on this arc, so a
+        #    leaf without it is refused by the api and the agent even though
+        #    every X509 purpose above is satisfied.
+        if openssl x509 -in "$DIR/leaf.pem" -noout -text | grep -q "$want_oid"; then
+          echo "    $PURPOSE purpose $want_oid: present"
+        else
+          echo "::error::rasputin-sign: the leaf is missing the $PURPOSE purpose $want_oid; artifactsig will refuse everything it signs."
+          failed=1
+        fi
+
+        if [ "$failed" -ne 0 ]; then
+          echo "::error::rasputin-sign: this credential is not usable as a $PURPOSE signing leaf; refusing to sign with it."
+          exit 1
+        fi
+        echo "==> Credential accepted by every consumer checked."
+
+        {
+          echo "dir=$DIR"
+          echo "key=$DIR/leaf.key"
+          echo "leaf=$DIR/leaf.pem"
+          echo "intermediate=$DIR/intermediate.pem"
+          echo "root=$DIR/root-ca.pem"
+          echo "purpose-oid=$want_oid"
+        } >> "$GITHUB_OUTPUT"
+
+    - name: Self-verify signed artifacts
+      if: ${{ inputs.mode == 'verify' }}
+      shell: bash
+      env:
+        PURPOSE: ${{ inputs.purpose }}
+        DIR: ${{ inputs.dir }}
+        ARTIFACTS: ${{ inputs.artifacts }}
+        SIG_SUFFIX: ${{ inputs.sig-suffix }}
+      run: |
+        set -euo pipefail
+
+        # Prove the signature verifies BEFORE it is published, the way the
+        # consumer of this purpose verifies it — not the way that happens to
+        # pass. A release artifact is checked as smimesign, which is what
+        # CMS_verify applies by default and therefore what the agent and every
+        # deployed board apply; naming it rather than relying on the default
+        # keeps the check readable next to the preflight. A catalog artifact is
+        # checked with `-purpose any`, because the catalog leaf deliberately
+        # lacks emailProtection and the default would reject it on that basis
+        # alone — the catalog verifier passes the same flag.
+        case "$PURPOSE" in
+          release) purpose_arg=smimesign ;;
+          catalog) purpose_arg=any ;;
+          '') echo "::error::rasputin-sign: purpose is required in verify mode (release|catalog)"; exit 1 ;;
+          *)  echo "::error::rasputin-sign: unknown purpose '$PURPOSE' (want release|catalog)"; exit 1 ;;
+        esac
+
+        if [ -z "${ARTIFACTS//[[:space:]]/}" ]; then
+          echo "::error::rasputin-sign: verify mode was given no artifacts. An empty list would report success without checking anything."
+          exit 1
+        fi
+
+        n=0
+        while IFS= read -r f; do
+          f="${f#"${f%%[![:space:]]*}"}"   # ltrim
+          f="${f%"${f##*[![:space:]]}"}"   # rtrim
+          [ -n "$f" ] || continue
+          sig="${f}${SIG_SUFFIX}"
+          if [ ! -f "$f" ]; then
+            echo "::error::rasputin-sign: no such artifact to verify: $f"; exit 1
+          fi
+          if [ ! -f "$sig" ]; then
+            echo "::error::rasputin-sign: artifact $f has no signature at $sig"; exit 1
+          fi
+          if openssl cms -verify -binary -inform DER -in "$sig" -content "$f" \
+               -CAfile "$DIR/root-ca.pem" -purpose "$purpose_arg" -out /dev/null; then
+            echo "    verified: $f"
+          else
+            echo "::error::rasputin-sign: $f does not verify against $sig and the trusted root. It must not be published."
+            exit 1
+          fi
+          n=$((n + 1))
+        done <<< "$ARTIFACTS"
+        echo "==> self-verified $n artifact(s) as $PURPOSE"
+
+    - name: Wipe the staged signing credential
+      if: ${{ inputs.mode == 'cleanup' }}
+      shell: bash
+      env:
+        DIR: ${{ inputs.dir }}
+      run: sudo umount "$DIR" 2>/dev/null || true

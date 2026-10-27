@@ -13,6 +13,9 @@ name: ci-debs
 #            starts cold.
 #   warm   — a second runner restores what `cold` saved and installs it with
 #            no download, and must report the cache hit.
+#   present — skip-if-present with every required command already on PATH
+#            installs nothing. (`cold` runs with it on and the command missing,
+#            so it covers the other branch.)
 #   reject — inputs the action must refuse. Each runs with continue-on-error
 #            and the last step fails the job if one was accepted.
 #
@@ -66,12 +69,15 @@ jobs:
           label: selftest-${{ github.run_id }}-${{ github.run_attempt }}
           packages: hello
           require: hello
+          skip-if-present: 'true'
       - name: It was a fetch, and the tool runs
         env:
           HIT: ${{ steps.debs.outputs.cache-hit }}
+          SKIPPED: ${{ steps.debs.outputs.skipped }}
         run: |
           set -euo pipefail
           [ "$HIT" != "true" ] || { echo "::error::a run-unique label hit the cache"; exit 1; }
+          [ "$SKIPPED" != "true" ] || { echo "::error::skip-if-present skipped with hello missing"; exit 1; }
           hello
 
   warm:
@@ -97,6 +103,33 @@ jobs:
           set -euo pipefail
           [ "$HIT" = "true" ] || { echo "::error::warm missed the cache cold saved (cache-hit=$HIT)"; exit 1; }
           hello
+
+  present:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Skip when the required commands are already here
+        id: debs
+        timeout-minutes: 5
+        uses: ./.github/actions/ci-debs
+        with:
+          label: present-${{ github.run_id }}-${{ github.run_attempt }}
+          packages: hello
+          require: bash sh
+          skip-if-present: 'true'
+      - name: It skipped, and installed nothing
+        env:
+          SKIPPED: ${{ steps.debs.outputs.skipped }}
+        run: |
+          set -euo pipefail
+          [ "$SKIPPED" = "true" ] || { echo "::error::skip-if-present did not skip (skipped=$SKIPPED)"; exit 1; }
+          if command -v hello >/dev/null 2>&1; then
+            echo "::error::hello was installed although the step skipped"
+            exit 1
+          fi
 
   reject:
     runs-on: ubuntu-latest
@@ -145,6 +178,29 @@ jobs:
           label: ''
           packages: hello
 
+      # "All required commands present" over an empty list is vacuously true;
+      # it must be refused, never read as "skip".
+      - name: skip-if-present with no require
+        id: skipnorequire
+        continue-on-error: true
+        timeout-minutes: 5
+        uses: ./.github/actions/ci-debs
+        with:
+          label: reject-skip-${{ github.run_id }}-${{ github.run_attempt }}
+          packages: hello
+          skip-if-present: 'true'
+
+      - name: skip-if-present that is not true or false
+        id: skipbad
+        continue-on-error: true
+        timeout-minutes: 5
+        uses: ./.github/actions/ci-debs
+        with:
+          label: reject-skipbad-${{ github.run_id }}-${{ github.run_attempt }}
+          packages: hello
+          require: bash
+          skip-if-present: 'yes'
+
       - name: Assert every rejection case was rejected
         env:
           OUTCOMES: |
@@ -152,6 +208,8 @@ jobs:
             nopkgs=${{ steps.nopkgs.outcome }}
             nosuchpkg=${{ steps.nosuchpkg.outcome }}
             nolabel=${{ steps.nolabel.outcome }}
+            skipnorequire=${{ steps.skipnorequire.outcome }}
+            skipbad=${{ steps.skipbad.outcome }}
         run: |
           set -euo pipefail
           bad=0

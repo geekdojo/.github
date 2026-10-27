@@ -8,14 +8,17 @@ name: ci-debs
 #            mirror dropped on the speed floor, wrong or truncated bytes
 #            refused, a tampered or unlisted cached .deb refused before apt
 #            sees it, a stable cache key.
-#   cold   — the action for real on a cache miss: resolve, fetch through the
-#            mirrors, install, save. The label carries the run id, so every run
-#            starts cold.
-#   warm   — a second runner restores what `cold` saved and installs it with
-#            no download, and must report the cache hit.
+#   cache  — the action for real. Cold first: a cache miss, so it resolves,
+#            fetches through the mirrors, installs and saves (the label carries
+#            the run id, so every run starts cold). Then warm, in the same job:
+#            hello is purged and the action run again, and it must restore what the cold step saved, report the cache hit, and
+#            install with no download. Same job on purpose: the key hashes the
+#            runner's installed package base, so a second job that lands on a
+#            newer runner image correctly misses (measured: run 40556053691,
+#            images 20261012 and 20261025 in one run).
 #   present — skip-if-present with every required command already on PATH
-#            installs nothing. (`cold` runs with it on and the command missing,
-#            so it covers the other branch.)
+#            installs nothing. (The cold step runs with it on and the command
+#            missing, so it covers the other branch.)
 #   reject — inputs the action must refuse. Each runs with continue-on-error
 #            and the last step fails the job if one was accepted.
 #
@@ -47,7 +50,7 @@ jobs:
           REQUIRE_DPKG: '1'
         run: bash .github/actions/ci-debs/test/ci-debs-test.sh
 
-  cold:
+  cache:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -79,17 +82,19 @@ jobs:
           [ "$HIT" != "true" ] || { echo "::error::a run-unique label hit the cache"; exit 1; }
           [ "$SKIPPED" != "true" ] || { echo "::error::skip-if-present skipped with hello missing"; exit 1; }
           hello
-
-  warm:
-    needs: cold
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Install from the cache cold saved
-        id: debs
+      # Purge, not remove: a removed package stays in dpkg's database, which
+      # would change the key and turn this into a miss.
+      - name: Purge hello, back to the base the key was taken on
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          sudo env DEBIAN_FRONTEND=noninteractive apt-get purge -y -q -o DPkg::Lock::Timeout=120 hello
+          if command -v hello >/dev/null 2>&1; then
+            echo "::error::hello is still on PATH after the purge"
+            exit 1
+          fi
+      - name: Install from the cache the cold step saved
+        id: warm
         timeout-minutes: 10
         uses: ./.github/actions/ci-debs
         with:
@@ -98,10 +103,10 @@ jobs:
           require: hello
       - name: It was a cache hit, and the tool runs
         env:
-          HIT: ${{ steps.debs.outputs.cache-hit }}
+          HIT: ${{ steps.warm.outputs.cache-hit }}
         run: |
           set -euo pipefail
-          [ "$HIT" = "true" ] || { echo "::error::warm missed the cache cold saved (cache-hit=$HIT)"; exit 1; }
+          [ "$HIT" = "true" ] || { echo "::error::the warm run missed the cache the cold run saved (cache-hit=$HIT)"; exit 1; }
           hello
 
   present:

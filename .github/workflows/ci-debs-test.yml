@@ -1,0 +1,169 @@
+name: ci-debs
+
+# Exercises .github/actions/ci-debs. Every Rasputin image build calls that
+# action by SHA for its apt installs, so a regression here is a lost image
+# build, and it would otherwise only show up inside one.
+#
+#   unit   — the script's own test against local HTTP mirrors: a trickling
+#            mirror dropped on the speed floor, wrong or truncated bytes
+#            refused, a tampered or unlisted cached .deb refused before apt
+#            sees it, a stable cache key.
+#   cold   — the action for real on a cache miss: resolve, fetch through the
+#            mirrors, install, save. The label carries the run id, so every run
+#            starts cold.
+#   warm   — a second runner restores what `cold` saved and installs it with
+#            no download, and must report the cache hit.
+#   reject — inputs the action must refuse. Each runs with continue-on-error
+#            and the last step fails the job if one was accepted.
+#
+# `hello` is the package: tiny, in main, no dependencies beyond libc.
+
+on:
+  push:
+    paths:
+      - '.github/actions/ci-debs/**'
+      - '.github/workflows/ci-debs-test.yml'
+  pull_request:
+    paths:
+      - '.github/actions/ci-debs/**'
+      - '.github/workflows/ci-debs-test.yml'
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: ci-debs.sh against local mirrors
+        env:
+          REQUIRE_DPKG: '1'
+        run: bash .github/actions/ci-debs/test/ci-debs-test.sh
+
+  cold:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: hello is not already installed
+        run: |
+          set -euo pipefail
+          if command -v hello >/dev/null 2>&1; then
+            echo "::error::hello is already on the runner, so this job proves nothing"
+            exit 1
+          fi
+      - name: Install on a cache miss
+        id: debs
+        timeout-minutes: 10
+        uses: ./.github/actions/ci-debs
+        with:
+          label: selftest-${{ github.run_id }}-${{ github.run_attempt }}
+          packages: hello
+          require: hello
+      - name: It was a fetch, and the tool runs
+        env:
+          HIT: ${{ steps.debs.outputs.cache-hit }}
+        run: |
+          set -euo pipefail
+          [ "$HIT" != "true" ] || { echo "::error::a run-unique label hit the cache"; exit 1; }
+          hello
+
+  warm:
+    needs: cold
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install from the cache cold saved
+        id: debs
+        timeout-minutes: 10
+        uses: ./.github/actions/ci-debs
+        with:
+          label: selftest-${{ github.run_id }}-${{ github.run_attempt }}
+          packages: hello
+          require: hello
+      - name: It was a cache hit, and the tool runs
+        env:
+          HIT: ${{ steps.debs.outputs.cache-hit }}
+        run: |
+          set -euo pipefail
+          [ "$HIT" = "true" ] || { echo "::error::warm missed the cache cold saved (cache-hit=$HIT)"; exit 1; }
+          hello
+
+  reject:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # A set that installs but does not provide the command the job needs
+      # must fail here, not halfway into the job.
+      - name: A required command the set does not provide
+        id: norequire
+        continue-on-error: true
+        timeout-minutes: 10
+        uses: ./.github/actions/ci-debs
+        with:
+          label: reject-require-${{ github.run_id }}-${{ github.run_attempt }}
+          packages: hello
+          require: no-such-command-ci-debs
+
+      - name: An empty package list
+        id: nopkgs
+        continue-on-error: true
+        timeout-minutes: 5
+        uses: ./.github/actions/ci-debs
+        with:
+          label: reject-empty-${{ github.run_id }}-${{ github.run_attempt }}
+          packages: ''
+
+      - name: A package no mirror has
+        id: nosuchpkg
+        continue-on-error: true
+        timeout-minutes: 10
+        uses: ./.github/actions/ci-debs
+        with:
+          label: reject-missing-${{ github.run_id }}-${{ github.run_attempt }}
+          packages: no-such-package-ci-debs
+
+      - name: An empty label
+        id: nolabel
+        continue-on-error: true
+        timeout-minutes: 5
+        uses: ./.github/actions/ci-debs
+        with:
+          label: ''
+          packages: hello
+
+      - name: Assert every rejection case was rejected
+        env:
+          OUTCOMES: |
+            norequire=${{ steps.norequire.outcome }}
+            nopkgs=${{ steps.nopkgs.outcome }}
+            nosuchpkg=${{ steps.nosuchpkg.outcome }}
+            nolabel=${{ steps.nolabel.outcome }}
+        run: |
+          set -euo pipefail
+          bad=0
+          while IFS= read -r line; do
+            [ -n "${line//[[:space:]]/}" ] || continue
+            name=${line%%=*}; outcome=${line#*=}
+            name=${name//[[:space:]]/}; outcome=${outcome//[[:space:]]/}
+            if [ "$outcome" = failure ]; then
+              echo "  rejected, as required: $name"
+            else
+              echo "::error::ci-debs ACCEPTED input it must refuse: $name (outcome=$outcome)"
+              bad=1
+            fi
+          done <<< "$OUTCOMES"
+          [ "$bad" -eq 0 ]
